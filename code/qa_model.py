@@ -1,50 +1,27 @@
-# Copyright 2018 Stanford University
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""This file defines the top-level model"""
-
-
-import time
 import logging
 import os
 import sys
+import time
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.ops import variable_scope as vs
 from tensorflow.python.ops import embedding_ops
 
-from evaluate import exact_match_score, f1_score
 from data_batcher import get_batch_generator
+from evaluate import exact_match_score, f1_score
+from modules import (BasicAttn, BidirectionAttention, RNNEncoder,
+                     SimpleSoftmaxLayer)
 from pretty_print import print_example
-from modules import RNNEncoder, SimpleSoftmaxLayer, BasicAttn, BidirectionAttention
 
 logging.basicConfig(level=logging.INFO)
 
 
 class QAModel(object):
-    """Top-level Question Answering module"""
 
     def __init__(self, FLAGS, id2word, word2id, emb_matrix):
         """
         Initializes the QA model.
-
-        Inputs:
-          FLAGS: the flags passed in from main.py
-          id2word: dictionary mapping word idx (int) to word (string)
-          word2id: dictionary mapping word (string) to word idx (int)
-          emb_matrix: numpy array shape (400002, embedding_size) containing pre-traing GloVe embeddings
         """
         print("Initializing the QAModel...")
         self.FLAGS = FLAGS
@@ -85,9 +62,6 @@ class QAModel(object):
         """
         Add placeholders to the graph. Placeholders are used to feed in inputs.
         """
-        # Add placeholders for inputs.
-        # These are all batch-first: the None corresponds to batch_size and
-        # allows you to run the same model with variable batch_size
         self.context_ids = tf.placeholder(
             tf.int32, shape=[None, self.FLAGS.context_len])
         self.context_mask = tf.placeholder(
@@ -98,22 +72,14 @@ class QAModel(object):
             tf.int32, shape=[None, self.FLAGS.question_len])
         self.ans_span = tf.placeholder(tf.int32, shape=[None, 2])
 
-        # Add a placeholder to feed in the keep probability (for dropout).
-        # This is necessary so that we can instruct the model to use dropout when training, but not when testing
         self.keep_prob = tf.placeholder_with_default(1.0, shape=())
 
     def add_embedding_layer(self, emb_matrix):
         """
         Adds word embedding layer to the graph.
-
-        Inputs:
-          emb_matrix: shape (400002, embedding_size).
-            The GloVe vectors, plus vectors for PAD and UNK.
         """
         with vs.variable_scope("embeddings"):
 
-            # Note: the embedding matrix is a tf.constant which means it's not a trainable parameter
-            # shape (400002, embedding_size)
             embedding_matrix = tf.constant(
                 emb_matrix, dtype=tf.float32, name="emb_matrix")
 
@@ -127,19 +93,11 @@ class QAModel(object):
                 embedding_matrix, self.qn_ids)
 
     def build_graph(self):
-        """Builds the main part of the graph for the model, starting from the input embeddings to the final distributions for the answer span.
-
-        Defines:
-          self.logits_start, self.logits_end: Both tensors shape (batch_size, context_len).
-            These are the logits (i.e. values that are fed into the softmax function) for the start and end distribution.
-            Important: these are -large in the pad locations. Necessary for when we feed into the cross entropy function.
-          self.probdist_start, self.probdist_end: Both shape (batch_size, context_len). Each row sums to 1.
-            These are the result of taking (masked) softmax of logits_start and logits_end.
+        """
+        Builds the main part of the graph for the model, starting from the input embeddings to the final distributions for the answer span.
         """
 
         # Use a RNN to get hidden states for the context and the question
-        # Note: here the RNNEncoder is shared (i.e. the weights are the same)
-        # between the context and the question.
         encoder = RNNEncoder(self.FLAGS.hidden_size, self.keep_prob)
         # (batch_size, context_len, hidden_size*2)
         context_hiddens = encoder.build_graph(
@@ -161,21 +119,16 @@ class QAModel(object):
             [context_hiddens, context_to_question, question_to_context], axis=2)
 
         # Apply fully connected layer to each blended representation
-        # Note, blended_reps_final corresponds to b' in the handout
-        # Note, tf.contrib.layers.fully_connected applies a ReLU non-linarity here by default
-        # blended_reps_final is shape (batch_size, context_len, hidden_size)
         blended_reps_final = tf.contrib.layers.fully_connected(
             blended_reps, num_outputs=self.FLAGS.hidden_size)
 
         # Use softmax layer to compute probability distribution for start location
-        # Note this produces self.logits_start and self.probdist_start, both of which have shape (batch_size, context_len)
         with vs.variable_scope("StartDist"):
             softmax_layer_start = SimpleSoftmaxLayer()
             self.logits_start, self.probdist_start = softmax_layer_start.build_graph(
                 blended_reps_final, self.context_mask)
 
         # Use softmax layer to compute probability distribution for end location
-        # Note this produces self.logits_end and self.probdist_end, both of which have shape (batch_size, context_len)
         with vs.variable_scope("EndDist"):
             softmax_layer_end = SimpleSoftmaxLayer()
             self.logits_end, self.probdist_end = softmax_layer_end.build_graph(
@@ -184,21 +137,6 @@ class QAModel(object):
     def add_loss(self):
         """
         Add loss computation to the graph.
-
-        Uses:
-          self.logits_start: shape (batch_size, context_len)
-            IMPORTANT: Assumes that self.logits_start is masked (i.e. has -large in masked locations).
-            That's because the tf.nn.sparse_softmax_cross_entropy_with_logits
-            function applies softmax and then computes cross-entropy loss.
-            So you need to apply masking to the logits (by subtracting large
-            number in the padding location) BEFORE you pass to the
-            sparse_softmax_cross_entropy_with_logits function.
-
-          self.ans_span: shape (batch_size, 2)
-            Contains the gold start and end locations
-
-        Defines:
-          self.loss_start, self.loss_end, self.loss: all scalar tensors
         """
         with vs.variable_scope("loss"):
 
@@ -222,17 +160,6 @@ class QAModel(object):
     def run_train_iter(self, session, batch, summary_writer):
         """
         This performs a single training iteration (forward pass, loss computation, backprop, parameter update)
-
-        Inputs:
-          session: TensorFlow session
-          batch: a Batch object
-          summary_writer: for Tensorboard
-
-        Returns:
-          loss: The loss (averaged across the batch) for this batch.
-          global_step: The current number of training iterations we've done
-          param_norm: Global norm of the parameters
-          gradient_norm: Global norm of the gradients
         """
         # Match up our input data with the placeholders
         input_feed = {}
@@ -259,13 +186,6 @@ class QAModel(object):
     def get_loss(self, session, batch):
         """
         Run forward-pass only; get loss.
-
-        Inputs:
-          session: TensorFlow session
-          batch: a Batch object
-
-        Returns:
-          loss: The loss (averaged across the batch) for this batch
         """
 
         input_feed = {}
@@ -285,20 +205,12 @@ class QAModel(object):
     def get_prob_dists(self, session, batch):
         """
         Run forward-pass only; get probability distributions for start and end positions.
-
-        Inputs:
-          session: TensorFlow session
-          batch: Batch object
-
-        Returns:
-          probdist_start and probdist_end: both shape (batch_size, context_len)
         """
         input_feed = {}
         input_feed[self.context_ids] = batch.context_ids
         input_feed[self.context_mask] = batch.context_mask
         input_feed[self.qn_ids] = batch.qn_ids
         input_feed[self.qn_mask] = batch.qn_mask
-        # note you don't supply keep_prob here, so it will default to 1 i.e. no dropout
 
         output_feed = [self.probdist_start, self.probdist_end]
         [probdist_start, probdist_end] = session.run(output_feed, input_feed)
@@ -307,14 +219,6 @@ class QAModel(object):
     def get_start_end_pos(self, session, batch):
         """
         Run forward-pass only; get the most likely answer span.
-
-        Inputs:
-          session: TensorFlow session
-          batch: Batch object
-
-        Returns:
-          start_pos, end_pos: both numpy arrays shape (batch_size).
-            The most likely start and end positions for each example in the batch.
         """
         # Get start_dist and end_dist, both shape (batch_size, context_len)
         start_dist, end_dist = self.get_prob_dists(session, batch)
@@ -328,23 +232,12 @@ class QAModel(object):
     def get_dev_loss(self, session, dev_context_path, dev_qn_path, dev_ans_path):
         """
         Get loss for entire dev set.
-
-        Inputs:
-          session: TensorFlow session
-          dev_qn_path, dev_context_path, dev_ans_path: paths to the dev.{context/question/answer} data files
-
-        Outputs:
-          dev_loss: float. Average loss across the dev set.
         """
         logging.info("Calculating dev loss...")
         tic = time.time()
         loss_per_batch, batch_lengths = [], []
 
         # Iterate over dev set batches
-        # Note: here we set discard_long=True, meaning we discard any examples
-        # which are longer than our context_len or question_len.
-        # We need to do this because if, for example, the true answer is cut
-        # off the context, then the loss function is undefined.
         for batch in get_batch_generator(self.word2id, dev_context_path, dev_qn_path, dev_ans_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=True):
 
             # Get loss for this batch
@@ -370,25 +263,6 @@ class QAModel(object):
         For each sample, calculate F1 and EM score.
         Return average F1 and EM score for all samples.
         Optionally pretty-print examples.
-
-        Note: This function is not quite the same as the F1/EM numbers you get from "official_eval" mode.
-        This function uses the pre-processed version of the e.g. dev set for speed,
-        whereas "official_eval" mode uses the original JSON. Therefore:
-          1. official_eval takes your max F1/EM score w.r.t. the three reference answers,
-            whereas this function compares to just the first answer (which is what's saved in the preprocessed data)
-          2. Our preprocessed version of the dev set is missing some examples
-            due to tokenization issues (see squad_preprocess.py).
-            "official_eval" includes all examples.
-
-        Inputs:
-          session: TensorFlow session
-          qn_path, context_path, ans_path: paths to {dev/train}.{question/context/answer} data files.
-          dataset: string. Either "train" or "dev". Just for logging purposes.
-          num_samples: int. How many samples to use. If num_samples=0 then do whole dataset.
-          print_to_screen: if True, pretty-prints each example to screen
-
-        Returns:
-          F1 and EM: Scalars. The average across the sampled examples.
         """
         logging.info("Calculating F1/EM for %s examples in %s set..." %
                      (str(num_samples) if num_samples != 0 else "all", dataset))
@@ -398,9 +272,6 @@ class QAModel(object):
         example_num = 0
 
         tic = time.time()
-
-        # Note here we select discard_long=False because we want to sample from the entire dataset
-        # That means we're truncating, rather than discarding, examples with too-long context or questions
         for batch in get_batch_generator(self.word2id, context_path, qn_path, ans_path, self.FLAGS.batch_size, context_len=self.FLAGS.context_len, question_len=self.FLAGS.question_len, discard_long=False):
 
             pred_start_pos, pred_end_pos = self.get_start_end_pos(
@@ -414,8 +285,6 @@ class QAModel(object):
                 example_num += 1
 
                 # Get the predicted answer
-                # Important: batch.context_tokens contains the original words (no UNKs)
-                # You need to use the original no-UNK version when measuring F1/EM
                 pred_ans_tokens = batch.context_tokens[ex_idx][pred_ans_start: pred_ans_end + 1]
                 pred_answer = " ".join(pred_ans_tokens)
 
@@ -451,10 +320,6 @@ class QAModel(object):
     def train(self, session, train_context_path, train_qn_path, train_ans_path, dev_qn_path, dev_context_path, dev_ans_path):
         """
         Main training loop.
-
-        Inputs:
-          session: TensorFlow session
-          {train/dev}_{qn/context/ans}_path: paths to {train/dev}.{context/question/answer} data files
         """
 
         # Print number of model parameters
@@ -467,9 +332,6 @@ class QAModel(object):
 
         # We will keep track of exponentially-smoothed loss
         exp_loss = None
-
-        # Checkpoint management.
-        # We keep one latest checkpoint, and one best checkpoint (early stopping)
         checkpoint_path = os.path.join(self.FLAGS.train_dir, "qa.ckpt")
         bestmodel_dir = os.path.join(self.FLAGS.train_dir, "best_checkpoint")
         bestmodel_ckpt_path = os.path.join(bestmodel_dir, "qa_best.ckpt")

@@ -1,5 +1,3 @@
-""" Official evaluation script for v1.1 of the SQuAD dataset. """
-
 from collections import Counter
 import string
 import re

@@ -1,19 +1,3 @@
-# Copyright 2018 Stanford University
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""This file contains some basic model components"""
-
 import tensorflow as tf
 from tensorflow.python.ops.rnn_cell import DropoutWrapper
 from tensorflow.python.ops import variable_scope as vs
@@ -24,16 +8,6 @@ class RNNEncoder(object):
     """
     General-purpose module to encode a sequence using a RNN.
     It feeds the input through a RNN and returns all the hidden states.
-
-    Note: In lecture 8, we talked about how you might use a RNN as an "encoder"
-    to get a single, fixed size vector representation of a sequence
-    (e.g. by taking element-wise max of hidden states).
-    Here, we're using the RNN as an "encoder" but we're not taking max;
-    we're just returning all the hidden states. The terminology "encoder"
-    still applies because we're getting a different "encoding" of each
-    position in the sequence, and we'll use the encodings downstream in the model.
-
-    This code uses a bidirectional GRU, but you could experiment with other types of RNN.
     """
 
     def __init__(self, hidden_size, keep_prob):
@@ -56,12 +30,9 @@ class RNNEncoder(object):
         Inputs:
           inputs: Tensor shape (batch_size, seq_len, input_size)
           masks: Tensor shape (batch_size, seq_len).
-            Has 1s where there is real input, 0s where there's padding.
-            This is used to make sure tf.nn.bidirectional_dynamic_rnn doesn't iterate through masked steps.
 
         Returns:
           out: Tensor shape (batch_size, seq_len, hidden_size*2).
-            This is all hidden states (fw and bw hidden states are concatenated).
         """
         with vs.variable_scope("RNNEncoder"):
             input_lens = tf.reduce_sum(
@@ -83,18 +54,6 @@ class RNNEncoder(object):
 
 
 class BasicAttn(object):
-    """Module for basic attention.
-
-    Note: in this module we use the terminology of "keys" and "values" (see lectures).
-    In the terminology of "X attends to Y", "keys attend to values".
-
-    In the baseline model, the keys are the context hidden states
-    and the values are the question hidden states.
-
-    We choose to use general terminology of keys and values in this module
-    (rather than context and question) to avoid confusion if you reuse this
-    module with other inputs.
-    """
 
     def __init__(self, keep_prob, key_vec_size, value_vec_size):
         """
@@ -111,20 +70,6 @@ class BasicAttn(object):
         """
         Keys attend to values.
         For each key, return an attention distribution and an attention output vector.
-
-        Inputs:
-          values: Tensor shape (batch_size, num_values, value_vec_size).
-          values_mask: Tensor shape (batch_size, num_values).
-            1s where there's real input, 0s where there's padding
-          keys: Tensor shape (batch_size, num_keys, value_vec_size)
-
-        Outputs:
-          attn_dist: Tensor shape (batch_size, num_keys, num_values).
-            For each key, the distribution should sum to 1,
-            and should be 0 in the value locations that correspond to padding.
-          output: Tensor shape (batch_size, num_keys, hidden_size).
-            This is the attention output; the weighted sum of the values
-            (using the attention distribution as weights).
         """
         with vs.variable_scope("BasicAttn"):
 
@@ -164,20 +109,6 @@ class BidirectionAttention(BasicAttn):
         """
         Keys attend to values.
         For each key, return an attention distribution and an attention output vector.
-
-        Inputs:
-          values: Tensor shape (batch_size, num_values, value_vec_size).
-          values_mask: Tensor shape (batch_size, num_values).
-            1s where there's real input, 0s where there's padding
-          keys: Tensor shape (batch_size, num_keys, value_vec_size)
-
-        Outputs:
-          attn_dist: Tensor shape (batch_size, num_keys, num_values).
-            For each key, the distribution should sum to 1,
-            and should be 0 in the value locations that correspond to padding.
-          output: Tensor shape (batch_size, num_keys, hidden_size).
-            This is the attention output; the weighted sum of the values
-            (using the attention distribution as weights).
         """
         with vs.variable_scope("BidirectionalAttention"):
             num_keys = keys.get_shape().as_list()[1]
@@ -185,36 +116,39 @@ class BidirectionAttention(BasicAttn):
 
             # Reshape keys and values
             keys_rows = tf.tile(
-              input=tf.reshape(keys, shape=[-1, num_keys, 1, self.value_vec_size]),
-              multiples=[1, 1, num_values, 1])
+                input=tf.reshape(
+                    keys, shape=[-1, num_keys, 1, self.value_vec_size]),
+                multiples=[1, 1, num_values, 1])
             values_rows = tf.tile(
-              input=tf.reshape(values, shape=[-1, 1, num_values, self.value_vec_size]),
-              multiples=[1, num_keys, 1, 1]
+                input=tf.reshape(
+                    values, shape=[-1, 1, num_values, self.value_vec_size]),
+                multiples=[1, num_keys, 1, 1]
             )
             args = tf.reshape(
-              tf.concat([keys_rows, values_rows, keys_rows*values_rows], 3),
-              shape=[-1, 3*self.value_vec_size])
+                tf.concat([keys_rows, values_rows, keys_rows*values_rows], 3),
+                shape=[-1, 3*self.value_vec_size])
 
             # Calculate similarity matrix
             W = tf.get_variable("W", shape=[3*self.value_vec_size, 1])
             b = tf.get_variable("b", shape=[1])
             similarity_matrix = tf.matmul(args, W) + b
             # shape (batch_size, num_keys, num_values)
-            similarity_matrix = tf.reshape(similarity_matrix, 
-              shape=[-1, num_keys, num_values])
+            similarity_matrix = tf.reshape(similarity_matrix,
+                                           shape=[-1, num_keys, num_values])
 
             # Calculate keys_to_values
             # Use attention distribution to take weighted sum of values
             _, keys_to_values = masked_softmax(
-              similarity_matrix, tf.expand_dims(values_mask, 1), 2)
+                similarity_matrix, tf.expand_dims(values_mask, 1), 2)
             # shape (batch_size, num_keys, value_vec_size)
             keys_to_values = tf.matmul(keys_to_values, values)
-            
+
             # Calculate values_to_keys
             # Use attention distribution to take weighted sum of keys
-            values_to_keys = tf.reduce_max(similarity_matrix, axis=2, keep_dims=True)
+            values_to_keys = tf.reduce_max(
+                similarity_matrix, axis=2, keep_dims=True)
             _, values_to_keys = masked_softmax(
-              values_to_keys, tf.expand_dims(keys_mask, 1), 2)
+                values_to_keys, tf.expand_dims(keys_mask, 1), 2)
             # shape (batch_size, num_values, value_vec_size)
             values_to_keys = tf.matmul(values_to_keys, keys)
 
@@ -228,21 +162,6 @@ class BidirectionAttention(BasicAttn):
 def masked_softmax(logits, mask, dim):
     """
     Takes masked softmax over given dimension of logits.
-
-    Inputs:
-      logits: Numpy array. We want to take softmax over dimension dim.
-      mask: Numpy array of same shape as logits.
-        Has 1s where there's real data in logits, 0 where there's padding
-      dim: int. dimension over which to take softmax
-
-    Returns:
-      masked_logits: Numpy array same shape as logits.
-        This is the same as logits, but with 1e30 subtracted
-        (i.e. very large negative number) in the padding locations.
-      prob_dist: Numpy array same shape as logits.
-        The result of taking softmax over masked_logits in given dimension.
-        Should be 0 in padding locations.
-        Should sum to 1 over given dimension.
     """
     exp_mask = (1 - tf.cast(mask, 'float')) * \
         (-1e30)  # -large where there's padding, 0 elsewhere
@@ -254,8 +173,7 @@ def masked_softmax(logits, mask, dim):
 
 class SimpleSoftmaxLayer(object):
     """
-    Module to take set of hidden states, (e.g. one for each context location),
-    and return probability distribution over those states.
+    Module to take set of hidden states, and return probability distribution over those states.
     """
 
     def __init__(self):
@@ -264,19 +182,6 @@ class SimpleSoftmaxLayer(object):
     def build_graph(self, inputs, masks):
         """
         Applies one linear downprojection layer, then softmax.
-
-        Inputs:
-          inputs: Tensor shape (batch_size, seq_len, hidden_size)
-          masks: Tensor shape (batch_size, seq_len)
-            Has 1s where there is real input, 0s where there's padding.
-
-        Outputs:
-          logits: Tensor shape (batch_size, seq_len)
-            logits is the result of the downprojection layer, but it has -1e30
-            (i.e. very large negative number) in the padded locations
-          prob_dist: Tensor shape (batch_size, seq_len)
-            The result of taking softmax over logits.
-            This should have 0 in the padded locations, and the rest should sum to 1.
         """
         with vs.variable_scope("SimpleSoftmaxLayer"):
 
